@@ -572,11 +572,47 @@ class OVQwen3ASRPipeline:
         self.pos_emb = SinusoidsPositionEmbedding(self.max_source_positions, self.d_model)
 
         print(f"Loading OV models from {model_dir} on {device}…")
-        self.audio_conv = core.compile_model(self.model_dir / "openvino_audio_conv_model.xml", device)
-        self.audio_encoder = core.compile_model(self.model_dir / "openvino_audio_encoder_model.xml", device)
-        self.text_emb = core.compile_model(self.model_dir / "openvino_text_embeddings_model.xml", device)
 
-        lm = core.read_model(self.model_dir / "openvino_language_model.xml")
+        # Support both naming conventions:
+        # Self-contained conversion: openvino_audio_conv_model.xml (root)
+        # Optimum-intel conversion:  thinker/openvino_thinker_audio_model.xml
+        root = self.model_dir
+        thinker_dir = self.model_dir / "thinker"
+
+        def _find_model(self_names, optimum_names):
+            """Find model file from self-contained or optimum naming."""
+            for name in self_names:
+                if (root / name).exists():
+                    return root / name
+            for name in optimum_names:
+                if (thinker_dir / name).exists():
+                    return thinker_dir / name
+            raise FileNotFoundError(
+                f"Could not find model. Tried: {self_names} in {root}, {optimum_names} in {thinker_dir}"
+            )
+
+        conv_path = _find_model(
+            ["openvino_audio_conv_model.xml"],
+            ["openvino_thinker_audio_model.xml"],
+        )
+        enc_path = _find_model(
+            ["openvino_audio_encoder_model.xml"],
+            ["openvino_thinker_audio_encoder_model.xml"],
+        )
+        emb_path = _find_model(
+            ["openvino_text_embeddings_model.xml"],
+            ["openvino_thinker_embedding_model.xml"],
+        )
+        lm_path = _find_model(
+            ["openvino_language_model.xml"],
+            ["openvino_thinker_language_model.xml"],
+        )
+
+        self.audio_conv = core.compile_model(conv_path, device)
+        self.audio_encoder = core.compile_model(enc_path, device)
+        self.text_emb = core.compile_model(emb_path, device)
+
+        lm = core.read_model(lm_path)
         self.lm_input_names = {k.get_any_name(): i for i, k in enumerate(lm.inputs)}
 
         # Detect whether language model expects 3-D position_ids [3, batch, seq]

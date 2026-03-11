@@ -75,7 +75,7 @@ def make_demo(model, processor, model_name="Qwen3_VL"):
 
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(model.device)
+        inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
 
         tokenizer = processor.tokenizer
         streamer = TextIteratorStreamer(tokenizer, timeout=3600.0, skip_prompt=True, skip_special_tokens=True)
@@ -90,94 +90,102 @@ def make_demo(model, processor, model_name="Qwen3_VL"):
             generated_text += new_text
             yield generated_text
 
-    def create_predict_fn():
-        def predict(_chatbot, task_history):
-            chat_query = _chatbot[-1][0]
-            query = task_history[-1][0]
-            if len(chat_query) == 0:
-                _chatbot.pop()
-                task_history.pop()
-                return _chatbot
-            print("User: " + _parse_text(query))
-            history_cp = copy.deepcopy(task_history)
-            full_response = ""
+    def predict(history):
+        """Build multi-turn messages from chat history and stream a response."""
+        messages = []
 
-            messages = []
-            content = []
-            for q, a in history_cp:
-                if isinstance(q, (tuple, list)):
-                    if is_video_file(q[0]):
-                        content.append({"video": f"file://{q[0]}"})
-                    else:
-                        content.append({"image": f"file://{q[0]}"})
-                else:
-                    content.append({"text": q})
-                    messages.append({"role": "user", "content": content})
-                    messages.append({"role": "assistant", "content": [{"text": a}]})
-                    content = []
+        for msg in history:
+            role = msg["role"]
+            raw_content = msg.get("content")
+
+            # Gradio 6.9+ preprocesses chatbot content into a list of typed dicts:
+            # [{'type': 'text', 'text': '...'}, {'type': 'file', 'file': {...}}, ...]
+            # Older Gradio passes plain strings or dicts.
+            if isinstance(raw_content, list):
+                content_items = raw_content
+            elif isinstance(raw_content, str):
+                content_items = [{"type": "text", "text": raw_content}]
+            elif isinstance(raw_content, dict) and "path" in raw_content:
+                content_items = [{"type": "file", "file": raw_content}]
+            else:
+                continue
+
+            if role == "user":
+                built = []
+                for item in content_items:
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        text_val = item.get("text", "")
+                        if text_val:
+                            built.append({"text": text_val})
+                    elif item_type == "file":
+                        file_info = item.get("file", {})
+                        filepath = file_info.get("path", "") if isinstance(file_info, dict) else str(file_info)
+                        if filepath:
+                            if is_video_file(filepath):
+                                built.append({"video": f"file://{filepath}"})
+                            else:
+                                built.append({"image": f"file://{filepath}"})
+                    # Legacy: plain dict with "path" key (older Gradio)
+                    elif "path" in item:
+                        filepath = item["path"]
+                        if is_video_file(filepath):
+                            built.append({"video": f"file://{filepath}"})
+                        else:
+                            built.append({"image": f"file://{filepath}"})
+                if built:
+                    messages.append({"role": "user", "content": built})
+
+            elif role == "assistant":
+                text_parts = [i.get("text", "") for i in content_items if i.get("type") == "text"]
+                text = " ".join(t for t in text_parts if t)
+                if text:
+                    messages.append({"role": "assistant", "content": [{"text": text}]})
+
+        # Remove last assistant (the empty placeholder we'll fill)
+        if messages and messages[-1]["role"] == "assistant":
             messages.pop()
 
-            for response in call_local_model(model, processor, messages):
-                _chatbot[-1] = (_parse_text(chat_query), _remove_image_special(_parse_text(response)))
-                yield _chatbot
-                full_response = _parse_text(response)
+        if not messages:
+            return
 
-            task_history[-1] = (query, full_response)
-            print("Qwen3-VL: " + _parse_text(full_response))
-            yield _chatbot
+        for response in call_local_model(model, processor, messages):
+            history[-1]["content"] = [{"type": "text", "text": _remove_image_special(response)}]
+            yield history
 
-        return predict
+    def add_text(history, text):
+        history = history or []
+        if text and text.strip():
+            history.append({"role": "user", "content": [{"type": "text", "text": text}]})
+            history.append({"role": "assistant", "content": [{"type": "text", "text": ""}]})
+        return history, ""
 
-    def create_regenerate_fn():
-        def regenerate(_chatbot, task_history):
-            if not task_history:
-                return _chatbot
-            item = task_history[-1]
-            if item[1] is None:
-                return _chatbot
-            task_history[-1] = (item[0], None)
-            chatbot_item = _chatbot.pop(-1)
-            if chatbot_item[0] is None:
-                _chatbot[-1] = (_chatbot[-1][0], None)
-            else:
-                _chatbot.append((chatbot_item[0], None))
-            _chatbot_gen = predict(_chatbot, task_history)
-            for _chatbot in _chatbot_gen:
-                yield _chatbot
+    def add_file(history, file):
+        history = history or []
+        filepath = file if isinstance(file, str) else file.name
+        history.append({"role": "user", "content": [{"type": "file", "file": {"path": filepath}}]})
+        return history
 
-        return regenerate
-
-    predict = create_predict_fn()
-    regenerate = create_regenerate_fn()
-
-    def add_text(history, task_history, text):
-        task_text = text
-        history = history if history is not None else []
-        task_history = task_history if task_history is not None else []
-        history = history + [(_parse_text(text), None)]
-        task_history = task_history + [(task_text, None)]
-        return history, task_history, ""
-
-    def add_file(history, task_history, file):
-        history = history if history is not None else []
-        task_history = task_history if task_history is not None else []
-        history = history + [((file.name,), None)]
-        task_history = task_history + [((file.name,), None)]
-        return history, task_history
-
-    def reset_user_input():
-        return gr.update(value="")
-
-    def reset_state(task_history):
-        task_history.clear()
+    def reset_state():
         return []
+
+    def regenerate(history):
+        if not history:
+            return history
+        # Remove last assistant message
+        while history and history[-1]["role"] == "assistant":
+            history.pop()
+        if not history:
+            return history
+        # Add empty assistant placeholder
+        history.append({"role": "assistant", "content": [{"type": "text", "text": ""}]})
+        yield from predict(history)
 
     with gr.Blocks() as demo:
         gr.Markdown(f"""<center><font size=8>{model_name} OpenVINO 演示</center>""")
 
-        chatbot = gr.Chatbot(label=model_name, elem_classes="control-height", height=500, type="tuples")
+        chatbot = gr.Chatbot(label=model_name, height=500)
         query = gr.Textbox(lines=2, label="输入")
-        task_history = gr.State([])
 
         with gr.Row():
             addfile_btn = gr.UploadButton("📁 上传文件", file_types=["image", "video"])
@@ -185,12 +193,11 @@ def make_demo(model, processor, model_name="Qwen3_VL"):
             regen_btn = gr.Button("🤔️ 重新生成")
             empty_bin = gr.Button("🧹 清除历史")
 
-        submit_btn.click(add_text, [chatbot, task_history, query], [chatbot, task_history]).then(
-            predict, [chatbot, task_history], [chatbot], show_progress=True
+        submit_btn.click(add_text, [chatbot, query], [chatbot, query]).then(
+            predict, [chatbot], [chatbot], show_progress=True
         )
-        submit_btn.click(reset_user_input, [], [query])
-        empty_bin.click(reset_state, [task_history], [chatbot], show_progress=True)
-        regen_btn.click(regenerate, [chatbot, task_history], [chatbot], show_progress=True)
-        addfile_btn.upload(add_file, [chatbot, task_history, addfile_btn], [chatbot, task_history], show_progress=True)
+        empty_bin.click(reset_state, [], [chatbot], show_progress=True)
+        regen_btn.click(regenerate, [chatbot], [chatbot], show_progress=True)
+        addfile_btn.upload(add_file, [chatbot, addfile_btn], [chatbot], show_progress=True)
 
     return demo

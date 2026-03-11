@@ -19,7 +19,7 @@ git+https://github.com/huggingface/diffusers.git@a1f36ee3ef4ae1bf98bd260e5391972
 modelscope
 
 # Gradio UI
-gradio>=4.36
+gradio==6.9.0
 
 # VLM dependencies
 qwen-vl-utils
